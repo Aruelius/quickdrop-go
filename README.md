@@ -67,3 +67,7 @@ manager := transfer.NewTransferManager(result.Channel, result.MaxMessageSize, tr
 ### 模块路径
 
 正式模块路径为 `github.com/Aruelius/quickdrop-go`。首次发布标签后应保持该模块路径及全部 import 不变，确保下游项目可以持续正确解析 SDK。
+
+### 许可证
+
+本项目采用 [Apache License 2.0](LICENSE) 开源。
