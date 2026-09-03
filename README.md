@@ -27,7 +27,7 @@ naturally and do not confuse it with Pion's `webrtc` package:
 client, err := api.New("https://drop.example.com", token)
 connection := peer.New(client, credentials, true, peer.PeerOptions{})
 result, err := connection.Connect(ctx)
-manager := transfer.NewTransferManager(result.Channel, result.MaxMessageSize, transfer.TransferOptions{})
+manager := transfer.NewTransferManager(result.Transport, result.MaxMessageSize, transfer.TransferOptions{})
 ```
 
 Run `go test ./...` and `go vet ./...` before publishing. Protocol compatibility
@@ -59,7 +59,7 @@ continue to resolve the SDK correctly.
 client, err := api.New("https://drop.example.com", token)
 connection := peer.New(client, credentials, true, peer.PeerOptions{})
 result, err := connection.Connect(ctx)
-manager := transfer.NewTransferManager(result.Channel, result.MaxMessageSize, transfer.TransferOptions{})
+manager := transfer.NewTransferManager(result.Transport, result.MaxMessageSize, transfer.TransferOptions{})
 ```
 
 发布前运行 `go test ./...` 和 `go vet ./...`。协议兼容规则见 [`docs/protocol-v1.md`](docs/protocol-v1.md)，仓库版本兼容关系见 [`docs/compatibility.md`](docs/compatibility.md)。

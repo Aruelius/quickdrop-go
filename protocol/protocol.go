@@ -29,6 +29,7 @@ type FileMetadata struct {
 	LastModified int64  `json:"lastModified"`
 	SHA256       string `json:"sha256,omitempty"`
 	CommitAck    bool   `json:"commitAck,omitempty"`
+	ProgressAck  bool   `json:"progressAck,omitempty"`
 	Resume       bool   `json:"resume,omitempty"`
 }
 

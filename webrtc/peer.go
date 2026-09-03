@@ -11,25 +11,38 @@ import (
 	"time"
 
 	"github.com/Aruelius/quickdrop-go/api"
+	quickdropchannel "github.com/Aruelius/quickdrop-go/channel"
 	"github.com/Aruelius/quickdrop-go/signaling"
 	"github.com/pion/ice/v4"
 	"github.com/pion/webrtc/v4"
 )
 
 type PeerOptions struct {
-	UDPPort       int
-	DirectTimeout time.Duration
-	AllowRelay    bool
-	RelayProvider string
+	UDPPort               int
+	DirectTimeout         time.Duration
+	AllowRelay            bool
+	RelayProvider         string
+	ParallelConnections   int
+	SCTPReceiveBufferSize uint32
+	UDPBufferSize         int
 }
 
 type PeerResult struct {
 	Channel         *webrtc.DataChannel
+	Transport       quickdropchannel.Channel
 	Policy          api.ICEPolicy
 	Mode            string
 	LocalCandidate  string
 	RemoteCandidate string
 	MaxMessageSize  uint32
+}
+
+type ConnectionStats struct {
+	Connections            int     `json:"connections"`
+	CurrentRTTMilliseconds float64 `json:"currentRttMs,omitempty"`
+	BytesSent              uint64  `json:"bytesSent"`
+	BytesReceived          uint64  `json:"bytesReceived"`
+	PacketsDiscardedOnSend uint64  `json:"packetsDiscardedOnSend"`
 }
 
 type Peer struct {
@@ -39,6 +52,7 @@ type Peer struct {
 	options   PeerOptions
 	signaling *signaling.Signaling
 	udpMux    *ice.MultiUDPMuxDefault
+	transport *parallelChannel
 
 	mu                 sync.Mutex
 	pc                 *webrtc.PeerConnection
@@ -61,6 +75,13 @@ func New(client *api.Client, credentials api.Credentials, initiator bool, option
 	if options.RelayProvider == "" {
 		options.RelayProvider = "platform"
 	}
+	options.ParallelConnections = clampParallelConnections(options.ParallelConnections)
+	if options.SCTPReceiveBufferSize == 0 {
+		options.SCTPReceiveBufferSize = 16 * 1024 * 1024
+	}
+	if options.UDPBufferSize <= 0 {
+		options.UDPBufferSize = 8 * 1024 * 1024
+	}
 	return &Peer{client: client, creds: credentials, initiator: initiator, options: options, result: make(chan PeerResult, 1), errors: make(chan error, 1), negotiationStarted: make(chan struct{})}
 }
 
@@ -70,7 +91,11 @@ func (p *Peer) Connect(ctx context.Context) (PeerResult, error) {
 		return PeerResult{}, err
 	}
 	if p.options.UDPPort > 0 {
-		p.udpMux, err = ice.NewMultiUDPMuxFromPort(p.options.UDPPort)
+		p.udpMux, err = ice.NewMultiUDPMuxFromPort(
+			p.options.UDPPort,
+			ice.UDPMuxFromPortWithReadBufferSize(p.options.UDPBufferSize),
+			ice.UDPMuxFromPortWithWriteBufferSize(p.options.UDPBufferSize),
+		)
 		if err != nil {
 			return PeerResult{}, fmt.Errorf("listen UDP port %d: %w", p.options.UDPPort, err)
 		}
@@ -140,8 +165,8 @@ func (p *Peer) Close() error {
 		return nil
 	}
 	p.closed = true
-	pc, signaling := p.pc, p.signaling
-	p.pc, p.signaling = nil, nil
+	pc, signaling, transport := p.pc, p.signaling, p.transport
+	p.pc, p.signaling, p.transport = nil, nil, nil
 	p.mu.Unlock()
 	if signaling != nil {
 		_ = signaling.Close()
@@ -149,35 +174,72 @@ func (p *Peer) Close() error {
 	if pc != nil {
 		_ = pc.Close()
 	}
+	if transport != nil {
+		_ = transport.Close()
+	}
 	p.closeMux()
 	return nil
 }
 
+func (p *Peer) Stats() ConnectionStats {
+	p.mu.Lock()
+	primary, transport := p.pc, p.transport
+	p.mu.Unlock()
+	connections := make([]*webrtc.PeerConnection, 0, maxParallelConnections)
+	if primary != nil {
+		connections = append(connections, primary)
+	}
+	if transport != nil {
+		connections = append(connections, transport.secondaryPeerConnections()...)
+	}
+	stats := ConnectionStats{Connections: len(connections)}
+	var rttTotal float64
+	var rttSamples int
+	for _, connection := range connections {
+		for _, item := range connection.GetStats() {
+			pair, ok := item.(webrtc.ICECandidatePairStats)
+			if !ok || pair.State != webrtc.StatsICECandidatePairStateSucceeded || !pair.Nominated {
+				continue
+			}
+			stats.BytesSent += pair.BytesSent
+			stats.BytesReceived += pair.BytesReceived
+			stats.PacketsDiscardedOnSend += uint64(pair.PacketsDiscardedOnSend)
+			if pair.CurrentRoundTripTime > 0 {
+				rttTotal += pair.CurrentRoundTripTime * 1000
+				rttSamples++
+			}
+		}
+	}
+	if rttSamples > 0 {
+		stats.CurrentRTTMilliseconds = rttTotal / float64(rttSamples)
+	}
+	return stats
+}
+
 func (p *Peer) replaceConnection(configuration api.ICEConfiguration, createChannel bool) error {
-	setting := webrtc.SettingEngine{}
-	setting.SetIncludeLoopbackCandidate(true)
-	if p.udpMux != nil {
-		setting.SetICEUDPMux(p.udpMux)
-	}
-	api := webrtc.NewAPI(webrtc.WithSettingEngine(setting))
-	servers := make([]webrtc.ICEServer, 0, len(configuration.ICEServers))
-	for _, server := range configuration.ICEServers {
-		servers = append(servers, webrtc.ICEServer{URLs: server.URLs, Username: server.Username, Credential: server.Credential})
-	}
-	transportPolicy := webrtc.ICETransportPolicyAll
-	if configuration.Policy.Transport == "relay" {
-		transportPolicy = webrtc.ICETransportPolicyRelay
-	}
-	pc, err := api.NewPeerConnection(webrtc.Configuration{ICEServers: servers, ICETransportPolicy: transportPolicy})
+	pc, err := p.newPeerConnection(configuration)
 	if err != nil {
+		return err
+	}
+	negotiated := true
+	priorityID := uint16(1023)
+	ordered := true
+	priority, err := pc.CreateDataChannel("quickdrop-priority", &webrtc.DataChannelInit{Ordered: &ordered, Negotiated: &negotiated, ID: &priorityID})
+	if err != nil {
+		_ = pc.Close()
 		return err
 	}
 	p.mu.Lock()
 	previous := p.pc
+	previousTransport := p.transport
 	p.pc = pc
+	p.transport = nil
 	p.policy = configuration.Policy
 	p.pendingCandidates = nil
 	p.mu.Unlock()
+	if previousTransport != nil {
+		_ = previousTransport.Close()
+	}
 	if previous != nil {
 		_ = previous.Close()
 	}
@@ -213,25 +275,51 @@ func (p *Peer) replaceConnection(configuration api.ICEConfiguration, createChann
 			}
 		}
 	})
-	pc.OnDataChannel(func(channel *webrtc.DataChannel) { p.attachChannel(pc, channel) })
+	pc.OnDataChannel(func(channel *webrtc.DataChannel) { p.attachChannel(pc, channel, priority, configuration) })
 	if createChannel {
-		ordered := true
 		channel, createErr := pc.CreateDataChannel("quickdrop-data", &webrtc.DataChannelInit{Ordered: &ordered})
 		if createErr != nil {
 			_ = pc.Close()
 			return createErr
 		}
-		p.attachChannel(pc, channel)
+		p.attachChannel(pc, channel, priority, configuration)
 	}
 	return nil
 }
 
-func (p *Peer) attachChannel(pc *webrtc.PeerConnection, channel *webrtc.DataChannel) {
+func (p *Peer) newPeerConnection(configuration api.ICEConfiguration) (*webrtc.PeerConnection, error) {
+	setting := webrtc.SettingEngine{}
+	setting.SetIncludeLoopbackCandidate(true)
+	setting.SetSCTPMaxReceiveBufferSize(p.options.SCTPReceiveBufferSize)
+	if p.udpMux != nil {
+		setting.SetICEUDPMux(p.udpMux)
+	}
+	api := webrtc.NewAPI(webrtc.WithSettingEngine(setting))
+	servers := make([]webrtc.ICEServer, 0, len(configuration.ICEServers))
+	for _, server := range configuration.ICEServers {
+		servers = append(servers, webrtc.ICEServer{URLs: server.URLs, Username: server.Username, Credential: server.Credential})
+	}
+	transportPolicy := webrtc.ICETransportPolicyAll
+	if configuration.Policy.Transport == "relay" {
+		transportPolicy = webrtc.ICETransportPolicyRelay
+	}
+	return api.NewPeerConnection(webrtc.Configuration{ICEServers: servers, ICETransportPolicy: transportPolicy})
+}
+
+func (p *Peer) attachChannel(pc *webrtc.PeerConnection, channel, priority *webrtc.DataChannel, configuration api.ICEConfiguration) {
 	if channel.Label() != "quickdrop-data" {
 		_ = channel.Close()
 		return
 	}
-	channel.OnError(func(err error) { p.fail(fmt.Errorf("DataChannel: %w", err)) })
+	connections := p.options.ParallelConnections
+	if configuration.Policy.Transport == "relay" {
+		connections = 1
+	}
+	transport := newParallelChannel(channel, priority, parallelChannelOptions{
+		initiator: p.initiator, connections: connections,
+		newPeerConnection: func() (*webrtc.PeerConnection, error) { return p.newPeerConnection(configuration) },
+	})
+	transport.OnError(func(err error) { p.fail(fmt.Errorf("DataChannel: %w", err)) })
 	channel.OnOpen(func() {
 		p.mu.Lock()
 		if p.pc != pc || p.closed {
@@ -239,6 +327,7 @@ func (p *Peer) attachChannel(pc *webrtc.PeerConnection, channel *webrtc.DataChan
 			return
 		}
 		policy := p.policy
+		p.transport = transport
 		p.mu.Unlock()
 		maxMessageSize := uint32(0)
 		if transport := channel.Transport(); transport != nil {
@@ -246,8 +335,9 @@ func (p *Peer) attachChannel(pc *webrtc.PeerConnection, channel *webrtc.DataChan
 		}
 		mode, localCandidate, remoteCandidate := selectedConnectionInfo(channel, policy)
 		p.resultOnce.Do(func() {
-			p.result <- PeerResult{Channel: channel, Policy: policy, Mode: mode, LocalCandidate: localCandidate, RemoteCandidate: remoteCandidate, MaxMessageSize: maxMessageSize}
+			p.result <- PeerResult{Channel: channel, Transport: transport, Policy: policy, Mode: mode, LocalCandidate: localCandidate, RemoteCandidate: remoteCandidate, MaxMessageSize: maxMessageSize}
 		})
+		transport.start()
 	})
 }
 

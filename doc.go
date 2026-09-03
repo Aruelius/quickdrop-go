@@ -5,6 +5,7 @@ package quickdrop
 
 import (
 	"github.com/Aruelius/quickdrop-go/api"
+	quickdropchannel "github.com/Aruelius/quickdrop-go/channel"
 	"github.com/Aruelius/quickdrop-go/transfer"
 	peer "github.com/Aruelius/quickdrop-go/webrtc"
 )
@@ -17,6 +18,8 @@ type ICEConfiguration = api.ICEConfiguration
 type Peer = peer.Peer
 type PeerOptions = peer.PeerOptions
 type PeerResult = peer.PeerResult
+type ConnectionStats = peer.ConnectionStats
+type Channel = quickdropchannel.Channel
 type TransferManager = transfer.TransferManager
 type TransferOptions = transfer.TransferOptions
 type TransferEvent = transfer.TransferEvent

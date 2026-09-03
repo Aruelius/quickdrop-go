@@ -18,41 +18,50 @@ import (
 	"sync"
 	"time"
 
+	quickdropchannel "github.com/Aruelius/quickdrop-go/channel"
 	transferprotocol "github.com/Aruelius/quickdrop-go/protocol"
 	"github.com/pion/webrtc/v4"
 )
 
 const (
-	maxBufferedAmount  = 2 * 1024 * 1024
-	maxUnacknowledged  = 8 * 1024 * 1024
-	durableAckInterval = 8 * 1024 * 1024
+	maxBufferedAmount         = 2 * 1024 * 1024
+	maxUnacknowledged         = 8 * 1024 * 1024
+	defaultDurableAckInterval = 32 * 1024 * 1024
+	maxReorderBufferBytes     = 64 * 1024 * 1024
+	receiveEventQueueSize     = 256
+	progressAckInterval       = 512 * 1024
+	progressAckPeriod         = 100 * time.Millisecond
 )
 
 type TransferOptions struct {
-	ReceiveDir        string
-	AutoAccept        bool
-	AcceptFile        func(transferprotocol.FileMetadata) bool
-	Overwrite         bool
-	MaxFileSize       int64
-	BandwidthLimitBPS uint64
-	OnEvent           func(TransferEvent)
+	ReceiveDir               string
+	AutoAccept               bool
+	AcceptFile               func(transferprotocol.FileMetadata) bool
+	Overwrite                bool
+	MaxFileSize              int64
+	BandwidthLimitBPS        uint64
+	DurableAckInterval       int64
+	MaxReorderBufferBytes    int64
+	ReceiveCompletionTimeout time.Duration
+	OnEvent                  func(TransferEvent)
 }
 
 type TransferEvent struct {
-	Type        string `json:"type"`
-	TransferID  string `json:"transferId,omitempty"`
-	Name        string `json:"name,omitempty"`
-	Direction   string `json:"direction,omitempty"`
-	Transferred int64  `json:"transferred,omitempty"`
-	Size        int64  `json:"size,omitempty"`
-	SHA256      string `json:"sha256,omitempty"`
-	Path        string `json:"path,omitempty"`
-	Text        string `json:"text,omitempty"`
-	Message     string `json:"message,omitempty"`
+	Type                 string `json:"type"`
+	TransferID           string `json:"transferId,omitempty"`
+	Name                 string `json:"name,omitempty"`
+	Direction            string `json:"direction,omitempty"`
+	Transferred          int64  `json:"transferred,omitempty"`
+	Size                 int64  `json:"size,omitempty"`
+	SHA256               string `json:"sha256,omitempty"`
+	Path                 string `json:"path,omitempty"`
+	Text                 string `json:"text,omitempty"`
+	Message              string `json:"message,omitempty"`
+	CheckpointDurationMS int64  `json:"checkpointDurationMs,omitempty"`
 }
 
 type TransferManager struct {
-	channel        *webrtc.DataChannel
+	channel        quickdropchannel.Channel
 	options        TransferOptions
 	chunkSize      int
 	mu             sync.Mutex
@@ -60,16 +69,20 @@ type TransferManager struct {
 	senders        map[string]*sendState
 	receivers      map[string]*receiveState
 	closed         chan struct{}
+	writable       chan struct{}
 	closeOnce      sync.Once
 }
 
 type sendState struct {
-	accept chan int64
-	acks   chan struct{}
-	cancel chan error
-	mu     sync.Mutex
-	acked  int64
-	once   sync.Once
+	accept   chan int64
+	acks     chan struct{}
+	cancel   chan error
+	mu       sync.Mutex
+	acked    int64
+	received int64
+	name     string
+	size     int64
+	once     sync.Once
 }
 
 type receiveEvent struct {
@@ -86,6 +99,8 @@ type receiveState struct {
 	metaPath string
 	file     *os.File
 	events   chan receiveEvent
+	done     chan struct{}
+	doneOnce sync.Once
 }
 
 type partialMetadata struct {
@@ -93,13 +108,29 @@ type partialMetadata struct {
 	ReceivedBytes int64                         `json:"receivedBytes"`
 }
 
-func NewTransferManager(channel *webrtc.DataChannel, maxMessageSize uint32, options TransferOptions) *TransferManager {
+func NewTransferManager(channel quickdropchannel.Channel, maxMessageSize uint32, options TransferOptions) *TransferManager {
 	chunkSize := transferprotocol.DefaultChunkSize
 	if maxMessageSize > 4096 {
 		chunkSize = min(transferprotocol.TargetChunkSize, int(maxMessageSize)-4096)
 	}
-	manager := &TransferManager{channel: channel, options: options, chunkSize: chunkSize, senders: make(map[string]*sendState), receivers: make(map[string]*receiveState), closed: make(chan struct{})}
+	if options.DurableAckInterval <= 0 {
+		options.DurableAckInterval = defaultDurableAckInterval
+	}
+	if options.MaxReorderBufferBytes <= 0 {
+		options.MaxReorderBufferBytes = maxReorderBufferBytes
+	}
+	if options.ReceiveCompletionTimeout <= 0 {
+		options.ReceiveCompletionTimeout = 30 * time.Second
+	}
+	manager := &TransferManager{channel: channel, options: options, chunkSize: chunkSize, senders: make(map[string]*sendState), receivers: make(map[string]*receiveState), closed: make(chan struct{}), writable: make(chan struct{}, 1)}
 	channel.OnMessage(manager.handleMessage)
+	channel.SetBufferedAmountLowThreshold(maxBufferedAmount / 2)
+	channel.OnBufferedAmountLow(func() {
+		select {
+		case manager.writable <- struct{}{}:
+		default:
+		}
+	})
 	channel.OnClose(func() { manager.closeOnce.Do(func() { close(manager.closed) }) })
 	channel.OnError(func(err error) { manager.emit(TransferEvent{Type: "error", Message: err.Error()}) })
 	return manager
@@ -149,11 +180,11 @@ func (m *TransferManager) SendFile(ctx context.Context, path string) error {
 	}
 
 	transferID := randomID()
-	metadata := transferprotocol.FileMetadata{Name: info.Name(), Size: info.Size(), MIME: mime.TypeByExtension(filepath.Ext(info.Name())), ChunkSize: m.chunkSize, TotalChunks: transferprotocol.TotalChunks(info.Size(), m.chunkSize), LastModified: info.ModTime().UnixMilli(), SHA256: digest, CommitAck: true, Resume: true}
+	metadata := transferprotocol.FileMetadata{Name: info.Name(), Size: info.Size(), MIME: mime.TypeByExtension(filepath.Ext(info.Name())), ChunkSize: m.chunkSize, TotalChunks: transferprotocol.TotalChunks(info.Size(), m.chunkSize), LastModified: info.ModTime().UnixMilli(), SHA256: digest, CommitAck: true, ProgressAck: true, Resume: true}
 	if metadata.MIME == "" {
 		metadata.MIME = "application/octet-stream"
 	}
-	state := &sendState{accept: make(chan int64, 1), acks: make(chan struct{}, 1), cancel: make(chan error, 1)}
+	state := &sendState{accept: make(chan int64, 1), acks: make(chan struct{}, 1), cancel: make(chan error, 1), name: metadata.Name, size: metadata.Size}
 	m.mu.Lock()
 	m.senders[transferID] = state
 	m.mu.Unlock()
@@ -179,18 +210,19 @@ func (m *TransferManager) SendFile(ctx context.Context, path string) error {
 	if _, err := file.Seek(offset, io.SeekStart); err != nil {
 		return err
 	}
+	state.mu.Lock()
+	state.acked = offset
+	state.received = offset
+	state.mu.Unlock()
 	index := offset / int64(m.chunkSize)
 	buffer := make([]byte, m.chunkSize)
 	started := time.Now()
 	sentThisRun := int64(0)
 	for offset < info.Size() {
-		if err := waitForBuffer(ctx, m.channel); err != nil {
-			return err
-		}
 		state.mu.Lock()
-		acked := state.acked
+		received := state.received
 		state.mu.Unlock()
-		if offset-acked >= maxUnacknowledged {
+		if offset-received >= maxUnacknowledged {
 			select {
 			case <-state.acks:
 				continue
@@ -217,13 +249,12 @@ func (m *TransferManager) SendFile(ctx context.Context, path string) error {
 		if err := m.pace(ctx, sentThisRun+int64(len(packet)), started); err != nil {
 			return err
 		}
-		if err := m.channel.Send(packet); err != nil {
+		if err := m.sendBinary(ctx, packet); err != nil {
 			return err
 		}
 		offset += int64(n)
 		index++
 		sentThisRun += int64(len(packet))
-		m.emit(TransferEvent{Type: "progress", TransferID: transferID, Direction: "send", Name: metadata.Name, Transferred: offset, Size: metadata.Size})
 	}
 	if err := m.sendControl(transferprotocol.Control{Version: 1, Type: "file_end", TransferID: transferID, SHA256: digest}); err != nil {
 		return err
@@ -271,11 +302,10 @@ func (m *TransferManager) handleMessage(message webrtc.DataChannelMessage) {
 		_ = m.sendControl(transferprotocol.Control{Version: 1, Type: "file_cancel", TransferID: header.TransferID, Reason: "unknown transfer"})
 		return
 	}
-	data := append([]byte(nil), payload...)
 	select {
-	case receiver.events <- receiveEvent{header: &header, data: data}:
-	default:
-		_ = m.sendControl(transferprotocol.Control{Version: 1, Type: "file_cancel", TransferID: header.TransferID, Reason: "receiver is overloaded"})
+	case receiver.events <- receiveEvent{header: &header, data: payload}:
+	case <-receiver.done:
+	case <-m.closed:
 	}
 }
 
@@ -302,10 +332,38 @@ func (m *TransferManager) handleControl(message transferprotocol.Control) {
 		m.mu.Unlock()
 		if sender != nil {
 			sender.mu.Lock()
+			previous := sender.received
 			if message.ReceivedBytes > sender.acked {
 				sender.acked = message.ReceivedBytes
 			}
+			if message.ReceivedBytes > sender.received {
+				sender.received = message.ReceivedBytes
+			}
+			confirmed, name, size := sender.received, sender.name, sender.size
 			sender.mu.Unlock()
+			if confirmed > previous {
+				m.emit(TransferEvent{Type: "progress", TransferID: message.TransferID, Direction: "send", Name: name, Transferred: confirmed, Size: size})
+			}
+			select {
+			case sender.acks <- struct{}{}:
+			default:
+			}
+		}
+	case "file_progress":
+		m.mu.Lock()
+		sender := m.senders[message.TransferID]
+		m.mu.Unlock()
+		if sender != nil {
+			sender.mu.Lock()
+			previous := sender.received
+			if message.ReceivedBytes > sender.received {
+				sender.received = message.ReceivedBytes
+			}
+			confirmed, name, size := sender.received, sender.name, sender.size
+			sender.mu.Unlock()
+			if confirmed > previous {
+				m.emit(TransferEvent{Type: "progress", TransferID: message.TransferID, Direction: "send", Name: name, Transferred: confirmed, Size: size})
+			}
 			select {
 			case sender.acks <- struct{}{}:
 			default:
@@ -316,7 +374,11 @@ func (m *TransferManager) handleControl(message transferprotocol.Control) {
 		receiver := m.receivers[message.TransferID]
 		m.mu.Unlock()
 		if receiver != nil {
-			receiver.events <- receiveEvent{end: &message}
+			select {
+			case receiver.events <- receiveEvent{end: &message}:
+			case <-receiver.done:
+			case <-m.closed:
+			}
 		}
 	case "file_cancel":
 		m.mu.Lock()
@@ -437,7 +499,7 @@ func (m *TransferManager) startReceive(transferID string, metadata transferproto
 		m.receiveFailed(transferID, name, err)
 		return
 	}
-	state := &receiveState{metadata: metadata, path: target, partPath: partPath, metaPath: metaPath, file: file, events: make(chan receiveEvent, 64)}
+	state := &receiveState{metadata: metadata, path: target, partPath: partPath, metaPath: metaPath, file: file, events: make(chan receiveEvent, receiveEventQueueSize), done: make(chan struct{})}
 	m.mu.Lock()
 	if _, exists := m.receivers[transferID]; exists {
 		m.mu.Unlock()
@@ -479,74 +541,161 @@ func (m *TransferManager) receiveLoop(transferID string, state *receiveState, of
 		}
 	}
 	lastDurable := offset
-	for event := range state.events {
-		if event.cancel != nil {
-			m.finishReceiver(transferID)
-			m.emit(TransferEvent{Type: "cancelled", TransferID: transferID, Direction: "receive", Name: state.metadata.Name, Message: event.cancel.Error()})
-			return
+	lastProgressAck := offset
+	lastProgressAckAt := time.Now()
+	pending := make(map[int64]receiveEvent)
+	var pendingBytes int64
+	var end *transferprotocol.Control
+	var endTimer *time.Timer
+	var endDeadline <-chan time.Time
+	checkpoint := func() error {
+		started := time.Now()
+		if err := state.file.Sync(); err != nil {
+			return err
 		}
-		if event.header != nil {
-			header := event.header
-			if header.TransferID != transferID || header.Offset != expectedOffset || header.Index != expectedIndex || header.Length != len(event.data) || expectedOffset+int64(len(event.data)) > state.metadata.Size {
-				m.receiveFailed(transferID, state.metadata.Name, errors.New("file chunk order or length mismatch"))
-				return
-			}
-			if _, err := state.file.Write(event.data); err != nil {
+		duration := time.Since(started)
+		lastDurable = expectedOffset
+		if err := writePartialMetadata(state.metaPath, partialMetadata{File: state.metadata, ReceivedBytes: lastDurable}); err != nil {
+			return err
+		}
+		m.emit(TransferEvent{Type: "checkpoint", TransferID: transferID, Direction: "receive", Name: state.metadata.Name, Transferred: lastDurable, Size: state.metadata.Size, Path: state.path, CheckpointDurationMS: duration.Milliseconds()})
+		// The final acknowledgement is sent only after SHA-256 verification and
+		// the partial file has been atomically promoted to its destination.
+		if expectedOffset < state.metadata.Size || !state.metadata.CommitAck {
+			_ = m.sendControl(transferprotocol.Control{Version: 1, Type: "file_ack", TransferID: transferID, ReceivedBytes: lastDurable})
+		}
+		return nil
+	}
+	complete := func(message *transferprotocol.Control) bool {
+		if message == nil || expectedOffset != state.metadata.Size || len(pending) != 0 {
+			return false
+		}
+		digest := hex.EncodeToString(hash.Sum(nil))
+		expectedHash := state.metadata.SHA256
+		if expectedHash == "" {
+			expectedHash = message.SHA256
+		}
+		if expectedHash != "" && !strings.EqualFold(expectedHash, digest) {
+			m.receiveIntegrityFailed(transferID, state, errors.New("SHA-256 verification failed"))
+			return true
+		}
+		if lastDurable != expectedOffset {
+			if err := checkpoint(); err != nil {
 				m.receiveFailed(transferID, state.metadata.Name, err)
+				return true
+			}
+		}
+		if err := state.file.Close(); err != nil {
+			m.receiveFailed(transferID, state.metadata.Name, err)
+			return true
+		}
+		if m.options.Overwrite {
+			_ = os.Remove(state.path)
+		}
+		if err := os.Rename(state.partPath, state.path); err != nil {
+			m.receiveFailed(transferID, state.metadata.Name, err)
+			return true
+		}
+		_ = os.Remove(state.metaPath)
+		_ = m.sendControl(transferprotocol.Control{Version: 1, Type: "file_ack", TransferID: transferID, ReceivedBytes: state.metadata.Size})
+		m.finishReceiver(transferID)
+		m.emit(TransferEvent{Type: "completed", TransferID: transferID, Direction: "receive", Name: state.metadata.Name, Transferred: state.metadata.Size, Size: state.metadata.Size, SHA256: digest, Path: state.path})
+		return true
+	}
+	for {
+		select {
+		case event := <-state.events:
+			if event.cancel != nil {
+				m.finishReceiver(transferID)
+				m.emit(TransferEvent{Type: "cancelled", TransferID: transferID, Direction: "receive", Name: state.metadata.Name, Message: event.cancel.Error()})
 				return
 			}
-			_, _ = hash.Write(event.data)
-			expectedOffset += int64(len(event.data))
-			expectedIndex++
-			if expectedOffset-lastDurable >= durableAckInterval || expectedOffset == state.metadata.Size {
-				if err := state.file.Sync(); err != nil {
+			if event.end != nil {
+				end = event.end
+				if complete(end) {
+					return
+				}
+				if endTimer == nil {
+					endTimer = time.NewTimer(m.options.ReceiveCompletionTimeout)
+					defer endTimer.Stop()
+					endDeadline = endTimer.C
+				}
+				continue
+			}
+			if event.header == nil {
+				continue
+			}
+			header := event.header
+			if header.TransferID != transferID || header.Index < 0 || header.Index >= state.metadata.TotalChunks || header.Length != len(event.data) {
+				m.receiveFailed(transferID, state.metadata.Name, errors.New("file chunk index or length mismatch"))
+				return
+			}
+			chunkOffset := header.Index * int64(state.metadata.ChunkSize)
+			chunkLength := min(int64(state.metadata.ChunkSize), state.metadata.Size-chunkOffset)
+			if header.Offset != chunkOffset || int64(header.Length) != chunkLength || chunkOffset < 0 || chunkOffset+chunkLength > state.metadata.Size {
+				m.receiveFailed(transferID, state.metadata.Name, errors.New("file chunk offset or length mismatch"))
+				return
+			}
+			if header.Index < expectedIndex {
+				continue
+			}
+			if _, duplicate := pending[header.Index]; duplicate {
+				m.receiveFailed(transferID, state.metadata.Name, errors.New("duplicate pending file chunk"))
+				return
+			}
+			pending[header.Index] = event
+			pendingBytes += int64(len(event.data))
+			if pendingBytes > m.options.MaxReorderBufferBytes {
+				m.receiveFailed(transferID, state.metadata.Name, errors.New("file chunk reorder buffer exceeded"))
+				return
+			}
+			for {
+				next, ok := pending[expectedIndex]
+				if !ok {
+					break
+				}
+				delete(pending, expectedIndex)
+				pendingBytes -= int64(len(next.data))
+				if next.header.Offset != expectedOffset {
+					m.receiveFailed(transferID, state.metadata.Name, errors.New("file chunk continuity mismatch"))
+					return
+				}
+				if _, err := state.file.Write(next.data); err != nil {
 					m.receiveFailed(transferID, state.metadata.Name, err)
 					return
 				}
-				lastDurable = expectedOffset
-				_ = writePartialMetadata(state.metaPath, partialMetadata{File: state.metadata, ReceivedBytes: lastDurable})
-				// The final acknowledgement is sent only after SHA-256 verification and
-				// the partial file has been atomically promoted to its destination.
-				if expectedOffset < state.metadata.Size || !state.metadata.CommitAck {
-					_ = m.sendControl(transferprotocol.Control{Version: 1, Type: "file_ack", TransferID: transferID, ReceivedBytes: lastDurable})
+				_, _ = hash.Write(next.data)
+				expectedOffset += int64(len(next.data))
+				expectedIndex++
+				if expectedOffset-lastDurable >= m.options.DurableAckInterval || expectedOffset == state.metadata.Size {
+					if err := checkpoint(); err != nil {
+						m.receiveFailed(transferID, state.metadata.Name, err)
+						return
+					}
+				}
+				m.emit(TransferEvent{Type: "progress", TransferID: transferID, Direction: "receive", Name: state.metadata.Name, Transferred: expectedOffset, Size: state.metadata.Size, Path: state.path})
+				now := time.Now()
+				if expectedOffset < state.metadata.Size && (expectedOffset-lastProgressAck >= progressAckInterval || now.Sub(lastProgressAckAt) >= progressAckPeriod) {
+					lastProgressAck = expectedOffset
+					lastProgressAckAt = now
+					messageType := "file_ack"
+					if state.metadata.ProgressAck {
+						messageType = "file_progress"
+					}
+					_ = m.sendControl(transferprotocol.Control{Version: 1, Type: messageType, TransferID: transferID, ReceivedBytes: expectedOffset})
 				}
 			}
-			m.emit(TransferEvent{Type: "progress", TransferID: transferID, Direction: "receive", Name: state.metadata.Name, Transferred: expectedOffset, Size: state.metadata.Size, Path: state.path})
-			continue
-		}
-		if event.end != nil {
-			if expectedOffset != state.metadata.Size {
-				m.receiveFailed(transferID, state.metadata.Name, errors.New("file ended before announced size"))
+			if complete(end) {
 				return
 			}
-			digest := hex.EncodeToString(hash.Sum(nil))
-			expectedHash := state.metadata.SHA256
-			if expectedHash == "" {
-				expectedHash = event.end.SHA256
-			}
-			if expectedHash != "" && !strings.EqualFold(expectedHash, digest) {
-				m.receiveIntegrityFailed(transferID, state, errors.New("SHA-256 verification failed"))
-				return
-			}
-			if err := state.file.Sync(); err != nil {
-				m.receiveFailed(transferID, state.metadata.Name, err)
-				return
-			}
-			if err := state.file.Close(); err != nil {
-				m.receiveFailed(transferID, state.metadata.Name, err)
-				return
-			}
-			if m.options.Overwrite {
-				_ = os.Remove(state.path)
-			}
-			if err := os.Rename(state.partPath, state.path); err != nil {
-				m.receiveFailed(transferID, state.metadata.Name, err)
-				return
-			}
-			_ = os.Remove(state.metaPath)
-			_ = m.sendControl(transferprotocol.Control{Version: 1, Type: "file_ack", TransferID: transferID, ReceivedBytes: state.metadata.Size})
+		case <-endDeadline:
+			m.receiveFailed(transferID, state.metadata.Name, errors.New("timed out waiting for missing file chunks"))
+			return
+		case <-state.done:
+			return
+		case <-m.closed:
 			m.finishReceiver(transferID)
-			m.emit(TransferEvent{Type: "completed", TransferID: transferID, Direction: "receive", Name: state.metadata.Name, Transferred: state.metadata.Size, Size: state.metadata.Size, SHA256: digest, Path: state.path})
+			m.emit(TransferEvent{Type: "failed", TransferID: transferID, Direction: "receive", Name: state.metadata.Name, Message: "DataChannel closed during transfer"})
 			return
 		}
 	}
@@ -585,6 +734,7 @@ func (m *TransferManager) finishReceiver(transferID string) {
 	delete(m.receivers, transferID)
 	m.mu.Unlock()
 	if state != nil {
+		state.doneOnce.Do(func() { close(state.done) })
 		_ = state.file.Close()
 	}
 }
@@ -622,14 +772,45 @@ func (m *TransferManager) emit(event TransferEvent) {
 	}
 }
 
-func waitForBuffer(ctx context.Context, channel *webrtc.DataChannel) error {
-	for channel.BufferedAmount() >= maxBufferedAmount {
+func (m *TransferManager) sendBinary(ctx context.Context, packet []byte) error {
+	started := time.Now()
+	for {
+		if err := m.waitForBuffer(ctx, len(packet)); err != nil {
+			return err
+		}
+		if err := m.channel.Send(packet); err == nil {
+			return nil
+		} else if m.channel.ReadyState() != webrtc.DataChannelStateOpen {
+			return err
+		} else if time.Since(started) >= 30*time.Second {
+			return fmt.Errorf("DataChannel send queue remained unavailable: %w", err)
+		}
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
+		case <-m.closed:
+			return errors.New("DataChannel is closed")
+		case <-m.writable:
 		case <-time.After(10 * time.Millisecond):
 		}
-		if channel.ReadyState() != webrtc.DataChannelStateOpen {
+	}
+}
+
+func (m *TransferManager) waitForBuffer(ctx context.Context, packetSize int) error {
+	required := uint64(packetSize)
+	if required > maxBufferedAmount {
+		return errors.New("DataChannel packet exceeds send queue high water mark")
+	}
+	for m.channel.BufferedAmount()+required > maxBufferedAmount {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-m.closed:
+			return errors.New("DataChannel is closed")
+		case <-m.writable:
+		case <-time.After(100 * time.Millisecond):
+		}
+		if m.channel.ReadyState() != webrtc.DataChannelStateOpen {
 			return errors.New("DataChannel is not open")
 		}
 	}

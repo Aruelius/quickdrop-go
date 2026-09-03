@@ -14,8 +14,12 @@ file contents are never sent through the QuickDrop HTTP server.
    optional `payload`. The peer server forwards `offer`, `answer`,
    `ice_candidate`, and transport coordination messages without interpreting
    their WebRTC payloads.
-5. The session creator is the offerer and creates the ordered DataChannel
-   labelled `quickdrop-data`. The joining peer answers it.
+5. The session creator is the offerer and creates the ordered, reliable
+   DataChannel labelled `quickdrop-data`. The joining peer answers it.
+6. New peers announce `parallel_capability` on `quickdrop-data`. The initiator
+   may then negotiate additional independent PeerConnections with reliable,
+   unordered `quickdrop-lane-N` DataChannels. A peer that ignores this optional
+   message remains fully compatible on the primary connection.
 
 ## DataChannel control messages
 
@@ -27,20 +31,38 @@ fields must be ignored so minor protocol extensions remain compatible.
 | `text` | `id`, `timestamp`, `payload.text` | UTF-8 text message |
 | `file_start` | `transferId`, `file` | Offer a file |
 | `file_accept` | `transferId` | Permit the sender to stream |
-| `file_ack` | `transferId`, `receivedBytes` | Receiver durability/progress acknowledgement |
+| `file_progress` | `transferId`, `receivedBytes` | Non-durable receiver progress and flow-control acknowledgement |
+| `file_ack` | `transferId`, `receivedBytes` | Durable checkpoint or final commit acknowledgement |
 | `file_end` | `transferId`, optional `sha256` | Sender reached EOF and publishes the streamed digest |
 | `file_cancel` | `transferId`, optional `reason` | Abort a transfer |
 | `resume_query` | `transferId`, `file` | Ask whether a partial file is reusable |
 | `resume_state` | `transferId`, `receivedBytes` | Resume from an acknowledged byte boundary |
 
 `file` contains `name`, `size`, `mime`, `chunkSize`, `totalChunks`, and
-`lastModified`. New senders may also include `sha256`, `commitAck`, and
-`resume`; old receivers ignore them. `commitAck: true` means the sender supports receiving
-the final `file_ack(size)` after `file_end` and destination commit. A receiver
-must preserve the legacy pre-`file_end` final acknowledgement when the field
+`lastModified`. New senders may also include `sha256`, `commitAck`,
+`progressAck`, and `resume`; old receivers ignore them. `commitAck: true` means
+the sender supports receiving the final `file_ack(size)` after `file_end` and
+destination commit. A receiver must preserve the legacy pre-`file_end` final
+acknowledgement when the field
 is absent, otherwise older senders would wait indefinitely. A receiver sends
 `resume_state` only when `resume: true`; otherwise it restarts at byte zero so
 an older sender cannot deadlock on an unknown resume message.
+
+`progressAck: true` advertises that the sender understands `file_progress`.
+Without it, receivers preserve the legacy behavior and use `file_ack` for
+flow-control progress. `file_progress` allows a new sender to keep a bounded
+amount of data in flight without forcing a filesystem sync for every small
+window. It must never be treated as resumable progress or final completion.
+Only `file_ack` advances the
+durable resume boundary, and `file_ack(size)` confirms the verified destination
+commit.
+
+The optional transport coordination messages are `parallel_capability`,
+`parallel_offer`, `parallel_answer`, and `parallel_ice`. They carry the
+negotiated connection count, lane index, SDP, or ICE candidate respectively.
+All text and protocol controls remain on `quickdrop-data`; only binary file
+packets may be striped across parallel lanes. `channel_capability` optionally
+enables reliable cancellation on the negotiated `quickdrop-priority` channel.
 
 ## Binary file packet
 
@@ -55,16 +77,21 @@ bytes ...   file payload
 ```
 
 The header contains `transferId`, `index`, `offset`, and `length`. Receivers
-must reject chunks that are out of order, overlap, exceed the announced file
-size, or do not match the payload length.
+must validate chunk boundaries, reject duplicates and overlaps, and use a
+bounded reorder buffer when parallel lanes deliver chunks out of order. A
+missing chunk must fail the transfer after a bounded completion timeout.
 
 ## Reliability and filesystems
 
-- DataChannel messages are ordered and reliable.
-- Senders still apply buffered-amount backpressure and wait for periodic
-  `file_ack` messages so application memory is bounded.
+- The primary DataChannel is ordered and reliable. Extra file lanes may be
+  unordered but must remain reliable.
+- Senders apply per-channel buffered-amount backpressure and wait for periodic
+  `file_progress` (or legacy `file_ack`) messages so application memory is
+  bounded.
 - Native receivers write to `<name>.quickdrop.part`, sync it, verify the
   optional SHA-256 digest, and atomically rename it only after `file_end`.
+- Native receivers periodically sync a durable checkpoint independently of
+  their more frequent flow-control progress reports.
 - The receiver sends `file_ack(size)` only after final size/hash validation and
   successful destination commit. The sender therefore sends `file_end` before
   waiting for the final acknowledgement.
